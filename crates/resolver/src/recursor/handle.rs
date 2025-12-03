@@ -753,12 +753,12 @@ mod for_dnssec {
 
     use super::*;
     use crate::proto::{
-        ProtoError,
+        NetError,
         op::{DnsRequest, DnsResponse, OpCode},
     };
 
     impl<P: ConnectionProvider> DnsHandle for RecursorDnsHandle<P> {
-        type Response = BoxStream<'static, Result<DnsResponse, ProtoError>>;
+        type Response = BoxStream<'static, Result<DnsResponse, NetError>>;
         type Runtime = P::RuntimeProvider;
 
         fn send(&self, request: DnsRequest) -> Self::Response {
@@ -766,12 +766,12 @@ mod for_dnssec {
                 if let Some(query) = request.queries().first().cloned() {
                     query
                 } else {
-                    return Box::pin(stream::once(future::err(ProtoError::from(
+                    return Box::pin(stream::once(future::err(NetError::from(
                         "no query in request",
                     ))));
                 }
             } else {
-                return Box::pin(stream::once(future::err(ProtoError::from(
+                return Box::pin(stream::once(future::err(NetError::from(
                     "request is not a query",
                 ))));
             };
@@ -789,7 +789,7 @@ mod for_dnssec {
                         return Err(match e.kind() {
                             // Translate back into a ProtoError::NoRecordsFound
                             ErrorKind::Negative(_fwd) => e.into(),
-                            _ => ProtoError::from(e.to_string()),
+                            _ => NetError::from(e.to_string()),
                         });
                     }
                 };
@@ -802,7 +802,7 @@ mod for_dnssec {
                 msg.add_authorities(response.authorities().iter().cloned());
                 msg.add_additionals(response.additionals().iter().cloned());
 
-                DnsResponse::from_message(msg)
+                DnsResponse::from_message(msg).map_err(NetError::from)
             })
             .boxed()
         }

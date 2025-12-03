@@ -35,7 +35,7 @@ use crate::{
         nsec3::verify_nsec3,
         rdata::{DNSKEY, DNSSECRData, DS, NSEC, RRSIG},
     },
-    error::{DnsError, NoRecords, ProtoError, ProtoErrorKind},
+    error::{DnsError, NetError, NetErrorKind, NoRecords, ProtoError, ProtoErrorKind},
     op::{DnsRequest, DnsRequestOptions, DnsResponse, Edns, Message, OpCode, Query, ResponseCode},
     rr::{Name, RData, Record, RecordType, SerialNumber, resource::RecordRef},
     runtime::{RuntimeProvider, Time},
@@ -158,15 +158,18 @@ impl<H: DnsHandle> DnssecDnsHandle<H> {
 
     async fn verify_response(
         self,
-        result: Result<DnsResponse, ProtoError>,
+        result: Result<DnsResponse, NetError>,
         query: Query,
         options: DnsRequestOptions,
-    ) -> Result<DnsResponse, ProtoError> {
+    ) -> Result<DnsResponse, NetError> {
         let mut message = match result {
             Ok(response) => response,
             // Translate NoRecordsFound errors into a DnsResponse message so the rest of the
             // DNSSEC handler chain can validate negative responses.
-            Err(err) => match err.kind {
+            Err(NetError {
+                kind: NetErrorKind::Proto(proto),
+                ..
+            }) => match proto.kind {
                 ProtoErrorKind::Dns(DnsError::NoRecordsFound(NoRecords {
                     query,
                     authorities,
@@ -187,14 +190,15 @@ impl<H: DnsHandle> DnssecDnsHandle<H> {
                     match DnsResponse::from_message(msg) {
                         Ok(response) => response,
                         Err(err) => {
-                            return Err(ProtoError::from(format!(
+                            return Err(NetError::from(format!(
                                 "unable to construct DnsResponse: {err:?}"
                             )));
                         }
                     }
                 }
-                _ => return Err(err),
+                _ => return Err(NetError::from(proto)),
             },
+            Err(err) => return Err(err),
         };
 
         debug!(
@@ -341,11 +345,11 @@ impl<H: DnsHandle> DnssecDnsHandle<H> {
         if !nsec_proof.is_secure() {
             debug!("returning Nsec error for {} {nsec_proof}", query.name());
             // TODO change this to remove the NSECs, like we do for the others?
-            return Err(ProtoError::from(DnsError::Nsec {
+            return Err(NetError::from(ProtoError::from(DnsError::Nsec {
                 query: Box::new(query.clone()),
                 response: Box::new(message),
                 proof: nsec_proof,
-            }));
+            })));
         }
 
         Ok(message)
@@ -534,8 +538,8 @@ impl<H: DnsHandle> DnssecDnsHandle<H> {
 
         match proof {
             // These could be transient errors that should be retried.
-            Err(ref e) if matches!(e.kind(), ProofErrorKind::Proto { .. }) => {
-                debug!("not caching DNSSEC validation with ProofErrorKind::Proto")
+            Err(ref e) if matches!(e.kind(), ProofErrorKind::Net { .. }) => {
+                debug!("not caching DNSSEC validation with ProofErrorKind::Net")
             }
             _ => {
                 debug!(
@@ -764,11 +768,14 @@ impl<H: DnsHandle> DnssecDnsHandle<H> {
                         break ancestor;
                     }
                 }
-                Err(e) if e.is_no_records_found() || e.is_nx_domain() => {}
-                Err(e) => {
+                Err(NetError {
+                    kind: NetErrorKind::Proto(e),
+                    ..
+                }) if e.is_no_records_found() || e.is_nx_domain() => {}
+                Err(net) => {
                     return Err(ProofError::new(
                         Proof::Bogus,
-                        ProofErrorKind::Proto { query, proto: e },
+                        ProofErrorKind::Net { query, net },
                     ));
                 }
             }
@@ -857,9 +864,15 @@ impl<H: DnsHandle> DnssecDnsHandle<H> {
         };
 
         // If the response was an empty DS RRset that was itself insecure, then we have another insecure zone.
-        if let Some(ProtoErrorKind::Dns(DnsError::Nsec { query, proof, .. })) =
-            error_opt.as_ref().map(|e| e.kind())
-        {
+        let dns_err = error_opt.as_ref().and_then(|e| match &e.kind {
+            NetErrorKind::Proto(ProtoError {
+                kind: ProtoErrorKind::Dns(err),
+                ..
+            }) => Some(err),
+            _ => None,
+        });
+
+        if let Some(DnsError::Nsec { query, proof, .. }) = dns_err {
             if proof.is_insecure() {
                 debug!(
                     "marking {} as insecure based on insecure NSEC/NSEC3 proof",
@@ -1010,9 +1023,9 @@ impl<H: DnsHandle> DnssecDnsHandle<H> {
                                         rrsig_index: Some(i),
                                     }))
                             }
-                            Err(proto) => Err(ProofError::new(
+                            Err(net) => Err(ProofError::new(
                                 Proof::Bogus,
-                                ProofErrorKind::Proto { query, proto },
+                                ProofErrorKind::Net { query, net },
                             )),
                         }),
                 )
@@ -1065,7 +1078,7 @@ impl<H: DnsHandle> DnssecDnsHandle<H> {
 
 #[cfg(any(feature = "std", feature = "no-std-rand"))]
 impl<H: DnsHandle> DnsHandle for DnssecDnsHandle<H> {
-    type Response = Pin<Box<dyn Stream<Item = Result<DnsResponse, ProtoError>> + Send>>;
+    type Response = Pin<Box<dyn Stream<Item = Result<DnsResponse, NetError>> + Send>>;
     type Runtime = H::Runtime;
 
     fn is_verifying_dnssec(&self) -> bool {
@@ -1077,7 +1090,7 @@ impl<H: DnsHandle> DnsHandle for DnssecDnsHandle<H> {
         // backstop
         if self.request_depth > request.options().max_request_depth {
             error!("exceeded max validation depth");
-            return Box::pin(stream::once(future::err(ProtoError::from(
+            return Box::pin(stream::once(future::err(NetError::from(
                 "exceeded max validation depth",
             ))));
         }
@@ -1093,7 +1106,7 @@ impl<H: DnsHandle> DnsHandle for DnssecDnsHandle<H> {
         let query = if let Some(query) = request.queries().first().cloned() {
             query
         } else {
-            return Box::pin(stream::once(future::err(ProtoError::from(
+            return Box::pin(stream::once(future::err(NetError::from(
                 "no query in request",
             ))));
         };

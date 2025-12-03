@@ -62,6 +62,204 @@ macro_rules! trace {
 /// An alias for results returned by functions of this crate
 pub(crate) type ProtoResult<T> = ::core::result::Result<T, ProtoError>;
 
+/// The error type for network protocol errors (UDP, TCP, QUIC, H2, H3)
+#[derive(Error, Clone, Debug)]
+#[non_exhaustive]
+pub struct NetError {
+    /// Kind of error that occurred
+    pub kind: NetErrorKind,
+    /// Backtrace to the source of the error
+    #[cfg(feature = "backtrace")]
+    pub backtrack: Option<ExtBacktrace>,
+}
+
+impl NetError {
+    /// Get the kind of the error
+    #[inline]
+    pub fn kind(&self) -> &NetErrorKind {
+        &self.kind
+    }
+}
+
+impl fmt::Display for NetError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        cfg_if::cfg_if! {
+            if #[cfg(feature = "backtrace")] {
+                if let Some(backtrace) = &self.backtrack {
+                    fmt::Display::fmt(&self.kind, f)?;
+                    fmt::Debug::fmt(backtrace, f)
+                } else {
+                    fmt::Display::fmt(&self.kind, f)
+                }
+            } else {
+                fmt::Display::fmt(&self.kind, f)
+            }
+        }
+    }
+}
+
+impl<E: Into<NetErrorKind>> From<E> for NetError {
+    fn from(error: E) -> Self {
+        Self {
+            kind: error.into(),
+            #[cfg(feature = "backtrace")]
+            backtrack: trace!(),
+        }
+    }
+}
+
+impl From<DnsError> for NetError {
+    fn from(dns_error: DnsError) -> Self {
+        NetError::from(ProtoError::from(ProtoErrorKind::Dns(dns_error)))
+    }
+}
+
+impl From<NoRecords> for NetError {
+    fn from(no_records: NoRecords) -> Self {
+        NetError::from(ProtoError::from(ProtoErrorKind::Dns(
+            DnsError::NoRecordsFound(no_records),
+        )))
+    }
+}
+
+impl From<String> for NetError {
+    fn from(msg: String) -> Self {
+        NetErrorKind::Msg(msg).into()
+    }
+}
+
+impl From<&'static str> for NetError {
+    fn from(msg: &'static str) -> Self {
+        NetErrorKind::Message(msg).into()
+    }
+}
+
+#[cfg(feature = "std")]
+impl From<NetError> for io::Error {
+    fn from(e: NetError) -> Self {
+        match e.kind() {
+            NetErrorKind::Timeout => Self::new(io::ErrorKind::TimedOut, e),
+            _ => Self::other(e),
+        }
+    }
+}
+
+#[cfg(feature = "wasm-bindgen")]
+impl From<NetError> for wasm_bindgen_crate::JsValue {
+    fn from(e: NetError) -> Self {
+        js_sys::Error::new(&e.to_string()).into()
+    }
+}
+
+/// The error kind for network protocol errors
+#[derive(Clone, Debug, EnumAsInner, Error)]
+#[non_exhaustive]
+pub enum NetErrorKind {
+    /// A UDP response was received with an incorrect transaction id, likely indicating a
+    /// cache-poisoning attempt.
+    #[error("bad transaction id received")]
+    BadTransactionId,
+
+    /// The underlying resource is too busy
+    ///
+    /// This is a signal that an internal resource is too busy. The intended action should be tried
+    /// again, ideally after waiting for a little while for the situation to improve. Alternatively,
+    /// the action could be tried on another resource (for example, in a name server pool).
+    #[error("resource too busy")]
+    Busy,
+
+    /// An error with an arbitrary message, referenced as &'static str
+    #[error("{0}")]
+    Message(&'static str),
+
+    /// An error with an arbitrary message, stored as String
+    #[error("{0}")]
+    Msg(String),
+
+    /// No connections available
+    #[error("no connections available")]
+    NoConnections,
+
+    /// Protocol error from higher layers
+    #[error("protocol error: {0}")]
+    Proto(#[from] ProtoError),
+
+    // foreign
+    /// An error got returned from IO
+    #[cfg(feature = "std")]
+    #[error("io error: {0}")]
+    Io(Arc<io::Error>),
+
+    /// A request timed out
+    #[error("request timed out")]
+    Timeout,
+
+    /// A Quinn (Quic) connection error occurred
+    #[cfg(feature = "__quic")]
+    #[error("error creating quic connection: {0}")]
+    QuinnConnect(#[from] quinn::ConnectError),
+
+    /// A Quinn (QUIC) connection error occurred
+    #[cfg(feature = "__quic")]
+    #[error("error with quic connection: {0}")]
+    QuinnConnection(#[from] quinn::ConnectionError),
+
+    /// A Quinn (QUIC) write error occurred
+    #[cfg(feature = "__quic")]
+    #[error("error writing to quic connection: {0}")]
+    QuinnWriteError(#[from] quinn::WriteError),
+
+    /// A Quinn (QUIC) read error occurred
+    #[cfg(feature = "__quic")]
+    #[error("error writing to quic read: {0}")]
+    QuinnReadError(#[from] quinn::ReadExactError),
+
+    /// A Quinn (QUIC) stream error occurred
+    #[cfg(feature = "__quic")]
+    #[error("referenced a closed QUIC stream: {0}")]
+    QuinnStreamError(#[from] quinn::ClosedStream),
+
+    /// A Quinn (QUIC) configuration error occurred
+    #[cfg(feature = "__quic")]
+    #[error("error constructing quic configuration: {0}")]
+    QuinnConfigError(#[from] quinn::ConfigError),
+
+    /// QUIC TLS config must include an AES-128-GCM cipher suite
+    #[cfg(feature = "__quic")]
+    #[error("QUIC TLS config must include an AES-128-GCM cipher suite")]
+    QuinnTlsConfigError(#[from] quinn::crypto::rustls::NoInitialCipherSuite),
+
+    /// Unknown QUIC stream used
+    #[cfg(feature = "__quic")]
+    #[error("an unknown quic stream was used")]
+    QuinnUnknownStreamError,
+
+    /// A quic message id should always be 0
+    #[cfg(feature = "__quic")]
+    #[error("quic messages should always be 0, got: {0}")]
+    QuicMessageIdNot0(u16),
+
+    /// A Rustls error occurred
+    #[cfg(feature = "__tls")]
+    #[error("rustls construction error: {0}")]
+    RustlsError(#[from] rustls::Error),
+
+    /// Case randomization is enabled, and a server did not echo a query name back with the same
+    /// case.
+    #[error("case of query name in response did not match")]
+    QueryCaseMismatch,
+}
+
+#[cfg(feature = "std")]
+impl From<io::Error> for NetErrorKind {
+    fn from(e: io::Error) -> Self {
+        match e.kind() {
+            io::ErrorKind::TimedOut => Self::Timeout,
+            _ => Self::Io(e.into()),
+        }
+    }
+}
+
 /// The error type for errors that get returned in the crate
 #[derive(Error, Clone, Debug)]
 #[non_exhaustive]
@@ -166,10 +364,7 @@ impl From<jni::errors::Error> for ProtoError {
 #[cfg(feature = "std")]
 impl From<ProtoError> for io::Error {
     fn from(e: ProtoError) -> Self {
-        match e.kind() {
-            ProtoErrorKind::Timeout => Self::new(io::ErrorKind::TimedOut, e),
-            _ => Self::other(e),
-        }
+        Self::other(e)
     }
 }
 
@@ -184,19 +379,6 @@ impl From<ProtoError> for wasm_bindgen_crate::JsValue {
 #[derive(Clone, Debug, EnumAsInner, Error)]
 #[non_exhaustive]
 pub enum ProtoErrorKind {
-    /// A UDP response was received with an incorrect transaction id, likely indicating a
-    /// cache-poisoning attempt.
-    #[error("bad transaction id received")]
-    BadTransactionId,
-
-    /// The underlying resource is too busy
-    ///
-    /// This is a signal that an internal resource is too busy. The intended action should be tried
-    /// again, ideally after waiting for a little while for the situation to improve. Alternatively,
-    /// the action could be tried on another resource (for example, in a name server pool).
-    #[error("resource too busy")]
-    Busy,
-
     /// Character data length exceeded the limit
     #[non_exhaustive]
     #[error("char data length exceeds {max}: {len}")]
@@ -241,10 +423,6 @@ pub enum ProtoErrorKind {
     #[error("{0}")]
     Msg(String),
 
-    /// No resolvers available
-    #[error("no connections available")]
-    NoConnections,
-
     /// Not all records were able to be written
     #[non_exhaustive]
     #[error("not all records could be written, wrote: {count}")]
@@ -252,16 +430,6 @@ pub enum ProtoErrorKind {
         /// Number of records that were written before the error
         count: usize,
     },
-
-    // foreign
-    /// An error got returned from IO
-    #[cfg(feature = "std")]
-    #[error("io error: {0}")]
-    Io(Arc<io::Error>),
-
-    /// A request timed out
-    #[error("request timed out")]
-    Timeout,
 
     /// An url parsing error
     #[error("url parsing error")]
@@ -279,75 +447,10 @@ pub enum ProtoErrorKind {
     #[error("error parsing int")]
     ParseInt(#[from] core::num::ParseIntError),
 
-    /// A Quinn (Quic) connection error occurred
-    #[cfg(feature = "__quic")]
-    #[error("error creating quic connection: {0}")]
-    QuinnConnect(#[from] quinn::ConnectError),
-
-    /// A Quinn (QUIC) connection error occurred
-    #[cfg(feature = "__quic")]
-    #[error("error with quic connection: {0}")]
-    QuinnConnection(#[from] quinn::ConnectionError),
-
-    /// A Quinn (QUIC) write error occurred
-    #[cfg(feature = "__quic")]
-    #[error("error writing to quic connection: {0}")]
-    QuinnWriteError(#[from] quinn::WriteError),
-
-    /// A Quinn (QUIC) read error occurred
-    #[cfg(feature = "__quic")]
-    #[error("error writing to quic read: {0}")]
-    QuinnReadError(#[from] quinn::ReadExactError),
-
-    /// A Quinn (QUIC) stream error occurred
-    #[cfg(feature = "__quic")]
-    #[error("referenced a closed QUIC stream: {0}")]
-    QuinnStreamError(#[from] quinn::ClosedStream),
-
-    /// A Quinn (QUIC) configuration error occurred
-    #[cfg(feature = "__quic")]
-    #[error("error constructing quic configuration: {0}")]
-    QuinnConfigError(#[from] quinn::ConfigError),
-
-    /// QUIC TLS config must include an AES-128-GCM cipher suite
-    #[cfg(feature = "__quic")]
-    #[error("QUIC TLS config must include an AES-128-GCM cipher suite")]
-    QuinnTlsConfigError(#[from] quinn::crypto::rustls::NoInitialCipherSuite),
-
-    /// Unknown QUIC stream used
-    #[cfg(feature = "__quic")]
-    #[error("an unknown quic stream was used")]
-    QuinnUnknownStreamError,
-
-    /// A quic message id should always be 0
-    #[cfg(feature = "__quic")]
-    #[error("quic messages should always be 0, got: {0}")]
-    QuicMessageIdNot0(u16),
-
-    /// A Rustls error occurred
-    #[cfg(feature = "__tls")]
-    #[error("rustls construction error: {0}")]
-    RustlsError(#[from] rustls::Error),
-
-    /// Case randomization is enabled, and a server did not echo a query name back with the same
-    /// case.
-    #[error("case of query name in response did not match")]
-    QueryCaseMismatch,
-
     /// A JNI call error
     #[cfg(target_os = "android")]
     #[error("JNI call error: {0}")]
     Jni(Arc<jni::errors::Error>),
-}
-
-#[cfg(feature = "std")]
-impl From<io::Error> for ProtoErrorKind {
-    fn from(e: io::Error) -> Self {
-        match e.kind() {
-            io::ErrorKind::TimedOut => Self::Timeout,
-            _ => Self::Io(e.into()),
-        }
-    }
 }
 
 /// Semantic DNS errors

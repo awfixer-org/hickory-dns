@@ -20,7 +20,7 @@ use crate::proto::{
     DnsError, ForwardNSData, ProtoErrorKind,
     op::ResponseCode,
     rr::{Name, Record, RecordType, rdata::SOA},
-    {NoRecords, ProtoError},
+    {NetError, NetErrorKind, NoRecords, ProtoError},
 };
 #[cfg(feature = "backtrace")]
 use crate::proto::{ExtBacktrace, trace};
@@ -60,8 +60,8 @@ pub enum ErrorKind {
     Io(#[from] std::io::Error),
 
     /// An error got returned by the hickory-proto crate
-    #[error("proto error: {0}")]
-    Proto(ProtoError),
+    #[error("net error: {0}")]
+    Net(NetError),
 
     /// A request timed out
     #[error("request timed out")]
@@ -100,7 +100,10 @@ impl Error {
     /// Returns true if the domain does not exist
     pub fn is_nx_domain(&self) -> bool {
         match &self.kind {
-            ErrorKind::Proto(proto) => proto.is_nx_domain(),
+            ErrorKind::Net(NetError {
+                kind: NetErrorKind::Proto(proto),
+                ..
+            }) => proto.is_nx_domain(),
             ErrorKind::Negative(fwd) => fwd.is_nx_domain(),
             _ => false,
         }
@@ -109,7 +112,10 @@ impl Error {
     /// Returns true if no records were returned
     pub fn is_no_records_found(&self) -> bool {
         match &self.kind {
-            ErrorKind::Proto(proto) => proto.is_no_records_found(),
+            ErrorKind::Net(NetError {
+                kind: NetErrorKind::Proto(proto),
+                ..
+            }) => proto.is_no_records_found(),
             ErrorKind::Negative(fwd) => fwd.is_no_records_found(),
             _ => false,
         }
@@ -117,17 +123,20 @@ impl Error {
 
     /// Returns true if a query timed out
     pub fn is_timeout(&self) -> bool {
-        let proto_error = match &self.kind {
-            ErrorKind::Proto(proto) => proto,
+        let net = match &self.kind {
+            ErrorKind::Net(net) => net,
             _ => return false,
         };
-        matches!(proto_error.kind(), ProtoErrorKind::Timeout)
+        matches!(net.kind(), NetErrorKind::Timeout)
     }
 
     /// Returns the SOA record, if the error contains one
     pub fn into_soa(self) -> Option<Box<Record<SOA>>> {
         match self.kind {
-            ErrorKind::Proto(proto) => proto.into_soa(),
+            ErrorKind::Net(NetError {
+                kind: NetErrorKind::Proto(proto),
+                ..
+            }) => proto.into_soa(),
             ErrorKind::Negative(fwd) => fwd.soa,
             _ => None,
         }
@@ -213,11 +222,14 @@ impl From<Error> for String {
     }
 }
 
-impl From<ProtoError> for Error {
-    fn from(e: ProtoError) -> Self {
+impl From<NetError> for Error {
+    fn from(e: NetError) -> Self {
         let no_records = match e.kind() {
-            ProtoErrorKind::Dns(DnsError::NoRecordsFound(no_records)) => no_records,
-            _ => return ErrorKind::Proto(e).into(),
+            NetErrorKind::Proto(ProtoError {
+                kind: ProtoErrorKind::Dns(DnsError::NoRecordsFound(no_records)),
+                ..
+            }) => no_records,
+            _ => return ErrorKind::Net(e).into(),
         };
 
         if let Some(ns) = &no_records.ns {
@@ -248,7 +260,7 @@ impl Clone for ErrorKind {
             Negative(ns) => Negative(ns.clone()),
             ForwardNS(ns) => ForwardNS(ns.clone()),
             Io(io) => Io(std::io::Error::from(io.kind())),
-            Proto(proto) => Proto(proto.clone()),
+            Net(net) => Net(net.clone()),
             Timeout => Self::Timeout,
             RecursionLimitExceeded { count } => RecursionLimitExceeded { count: *count },
         }

@@ -17,7 +17,7 @@ use futures_util::{StreamExt, future::BoxFuture, stream::Stream};
 use tracing::warn;
 
 use crate::BufDnsStreamHandle;
-use crate::error::ProtoError;
+use crate::error::NetError;
 use crate::op::SerialMessage;
 use crate::runtime::RuntimeProvider;
 #[cfg(feature = "tokio")]
@@ -84,12 +84,12 @@ impl<S: DnsTcpStream> DnsClientStream for TcpClientStream<S> {
 }
 
 impl<S: DnsTcpStream> Stream for TcpClientStream<S> {
-    type Item = Result<SerialMessage, ProtoError>;
+    type Item = Result<SerialMessage, NetError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let message = match self.tcp_stream.poll_next_unpin(cx) {
             Poll::Ready(Some(Ok(t))) => t,
-            Poll::Ready(Some(Err(e))) => return Poll::Ready(Some(Err(From::from(e)))),
+            Poll::Ready(Some(Err(e))) => return Poll::Ready(Some(Err(NetError::from(e)))),
             Poll::Ready(None) => return Poll::Ready(None),
             Poll::Pending => return Poll::Pending,
         };
